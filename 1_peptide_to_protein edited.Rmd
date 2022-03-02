@@ -1,0 +1,400 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Here, we begin the analysis on RNAse +/- control experiment from E.coli (page 164 from notebook 3 for further info)
+
+Experimental info. 5 samples in the stationary phase, (in LBM9?) treated with 700 mJ/cm2 in 15cm plate. For each sample there is an RNAse + and - run. Also- need to add detail of the MS run, note that these were analyzed independently (i.e. no match between runs). From the samples there were 2 (1 per group) that had to discarded from the analysis. The chromatograms were really bad. All the others were fine! 
+
+
+```{r}
+#### Load packages ####
+library(tidyverse)
+library(MSnbase)
+library(GO.db)
+library(biobroom)
+library(camprotR)
+library(plyr)
+library(dplyr)
+library(naniar)
+
+select <- dplyr::select
+
+suppressMessages(source("../../ecoli-rnase-main/shared_files/Utility.R", chdir = TRUE)) # need to change the path
+suppressMessages(source("../../ecoli-rnase-main/shared_files/OOPS_analysis.R", chdir = TRUE))
+```
+
+```{r}
+# set up standardized plotting scheme
+theme_set(theme_bw(base_size = 20) +
+           theme(panel.grid.major=element_blank(),
+                 panel.grid.minor=element_blank(),
+                 aspect.ratio=1, 
+                 plot.title = element_text(hjust = 0.5)))
+```
+
+Read individual files into a master df
+```{r}
+infiles <- Sys.glob('../raw/SeparateSearches/*PeptideGroups.txt')[1:2]
+df <- read.csv("../analysos/sample_names.csv") %>% mutate( concated_column = paste0(TRT, "_", rep, "_"))
+
+allData <- lapply(infiles, function(.file){
+  # read in file
+  .file = infiles[1]
+  dat <- read.delim(.file, header=T)
+  
+  for(i in 1:length(colnames(dat))){
+    var1 <- colnames(dat)[i]
+    for(j in 20:1){
+      #print('we are now processing')
+      #print(j)
+      samplen <- df$samples[j]
+      if(grepl(samplen, var1)==TRUE){
+       colnames(dat)[i] <- gsub(samplen, df$concated_column[j], colnames(dat)[i])
+        # extract important terms
+      }}}
+    file_name <- strsplit(.file, "_")[[1]]
+    # add the df
+    dat$id <- paste0(file_name[4], "_", file_name[3])
+    colnames(dat)
+})
+```
+
+```{r}
+identical(names(allData[[1]]), names(allData[[2]]) )
+# combine into a single dataframe
+myDF <- do.call(rbind, allData)
+print(table(myDF$id))
+
+test <- duplicated(myDF)
+table(test)
+
+#tiff('../figures/peptide_count_per_sample.tiff', units="in", width=5, height=4, res=300, compression = 'lzw')
+ggplot(data=as.data.frame(table(myDF$id)), aes(x=sub(".", "", Var1), y=Freq)) + geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + xlab("") + ylab("peptide count")
+#dev.off()
+```
+get list of crap accessions for filter step 
+```{r}
+# Load the cRAP FASTA used for the PD search
+crap.fasta <- Biostrings::fasta.index(
+  "../cRAP_FullIdentifiers.fasta",
+  seqtype = "AA"
+)
+
+# see species plot
+spcvec = c()
+for(i in 1:length(crap.fasta$desc)){
+  tmp = strsplit(crap.fasta$desc[i], "OS=")
+  tmp = strsplit(tmp[[1]][2], " ")
+  
+  spcvec[i] = paste0(tmp[[1]][1], "_", tmp[[1]][2])
+}
+
+print(table(spcvec))
+
+#tiff('../figures/crap_accessions.tiff', units="in", width=5, height=4, res=300, compression = 'lzw')
+table(spcvec) %>% as.data.frame() %>% 
+  ggplot(aes(y=reorder(spcvec, Freq), x = Freq)) + geom_bar(stat="identity") + ylab("species") +
+  ggtitle('crap.fasta by species')
+#dev.off()
+
+# Extract the non cRAP UniProt accessions associated with each cRAP protein
+crap.accessions <- crap.fasta %>% 
+  pull(desc) %>% 
+  stringr::str_extract_all("(?<=\\|).*?(?=\\|)") %>% 
+  unlist() %>% 
+  .[!. %in% "000000"] # remove invalid UniProt accessions
+``` 
+this crap list has a unique ecoli protein... need to look into securing a more comprehensive list.
+
+For now, lets use the functions in camprotR to parse the infile
+```{r}
+.data <- camprotR::parse_features(myDF, 
+                                  filter_crap = TRUE, 
+                                  crap_proteins = crap.accessions, filter_associated_crap = TRUE, 
+                                  unique_master = FALSE)
+# again, only 1 protein supplied as crap protein. 
+# add extra filters for contaminants
+
+
+length(colnames(myDF))
+length(unique(colnames(myDF)))
+
+
+.data <- .data %>% filter(Contaminant=='False')
+camprotR:::message_parse(.data, 'Master.Protein.Accessions', 'removed remaining contaminants')
+
+.data <- .data %>% filter(Quan.Info!='NoQuanValues')
+camprotR:::message_parse(.data, 'Master.Protein.Accessions', 'removed remaining contaminants')
+
+```
+
+Now, lets subset to the required abundance columns. This has not been analyzed by MBR (all samples analyzed independently)
+```{r}
+all_abun_cols <- colnames(.data)[grepl('^Abundance', colnames(.data))]
+print(all_abun_cols)
+
+abundance <- .data %>% 
+  select(c(Sequence, Modifications, Number.of.Missed.Cleavages,
+           Master.Protein.Accessions, Master.Protein.Descriptions, Abundance.F.Sample.B, id)) %>%
+  tidyr::pivot_wider(names_from=id, values_from=Abundance.F.Sample.B)
+
+print(head(abundance))
+
+# remove peptides with all missing vals
+abundance <- abundance %>% mutate(missingVals = rowSums(is.na(abundance)))
+print(table(abundance$missingVals))
+
+abundance <- abundance %>% filter(missingVals != 8)
+print(table(abundance$missingVals))
+```
+
+
+store the data into an msnset to manipulate the peptide object into protein vals
+```{r}
+eDat <- as.matrix(abundance[grepl('^B', colnames(abundance))])
+fDat <- abundance[,1:5] %>% as.data.frame()
+
+peptide_res <- MSnSet(exprs=eDat, fData=fDat)
+
+rownames(peptide_res) <- paste(fData(peptide_res)$Sequence, 
+                               fData(peptide_res)$Modifications, 
+                              # fData(peptide_res)$Number.of.Missed.Cleavages,
+                               fData(peptide_res)$Master.Protein.Accessions,
+                               sep=":")
+
+pDat <- pData(peptide_res) %>%
+  mutate(rep = gsub('[[:alpha:]]+_', '', rownames(.)),
+         sample = sub(".", "", gsub('_[[:digit:]]+', '', rownames(.))))
+
+# add the pData using the sample names (in the right order)
+pData(peptide_res) <- pDat[colnames(peptide_res),]
+```
+
+Let's check the sum and max intensity per sample
+```{r}
+plot_data <- exprs(peptide_res) %>% melt() %>% 
+  mutate(rep =  gsub('[[:alpha:]]+_', '', Var2), 
+         type = sub(".", "", gsub('_[[:digit:]]+', '', Var2))) %>%
+  group_by(rep, type) %>% 
+  dplyr::summarise(sum_intensity=sum(value, na.rm=TRUE),
+              max_intensity=max(value, na.rm=TRUE),
+              median_intensity=median(value, na.rm=TRUE),
+              length_intensity=sum(is.finite(value)))
+
+p <- plot_data %>% 
+  ggplot(aes(type, sum_intensity, fill=type, group=type)) +
+    geom_bar(stat='identity', position='dodge') +
+    theme_bw() +
+    facet_wrap(~rep)
+
+#tiff('../figures/sum_intensity.tiff', units="in", width=5, height=4, res=300, compression = 'lzw')
+print(p + ggtitle("sum intensity"))
+#dev.off()
+
+#tiff('../figures/max_intensity.tiff', units="in", width=5, height=4, res=300, compression = 'lzw')
+print(p + aes(y=max_intensity) + ggtitle("max intensity"))
+#dev.off()
+
+#tiff('../figures/meidan_intensity.tiff', units="in", width=5, height=4, res=300, compression = 'lzw')
+print(p + aes(y=median_intensity) + ggtitle("median intensity"))
+#dev.off()
+```
+In general, we see a higher intensity in the minus samples. this is expected as rbp's will leave the interface upon the digestion of rna. However, this may also be a bias in the data. the rnase+ samples are harder to process (the rna is what makes the pellet visible).
+
+```{r}
+#tiff('../figures/peptide_quant_log10_boxplot.tiff', units="in", width=5, height=4, res=300, compression = 'lzw')
+plot_quant(log(peptide_res, base=10), method='box') +
+  scale_x_discrete(labels=rownames(pData(peptide_res)))
+#dev.off()
+
+#tiff('../figures/peptide_quant_log10_density.tiff', units="in", width=5, height=4, res=300, compression = 'lzw')
+plot_quant(log(peptide_res, base=10), method='density') +
+  scale_colour_manual(labels=rownames(pData(peptide_res)),
+                      values=rep(get_cat_palette(4), 3))
+#dev.off()
+```
+
+Next we want to remove peptides which are not seen in enough samples and proteins which have too few peptides. Below we test a range of values for 'min_samples' and 'min_peptides' to see how this affects the number of peptides and proteins we retain.
+Note that at this point we still have lipoproteins since these are required downstream for the normalization. The protein count is excluding lipoproteins (which are shown separately).
+
+```{r}
+CheckFilteringOptions <- function(peptide_res,
+                                  min_samples_range=1:8,
+                                  min_peptides_range=1:4){
+  rows <- NULL
+  for(min_samples in min_samples_range){
+    for(min_peptides in min_peptides_range){
+      print(c(min_samples, min_peptides))
+      .data <- restrict_features_per_protein(
+        peptide_res, min_features=min_peptides, plot=FALSE)
+      
+      .data <- filterNA(.data, pNA=1-(min_samples/ncol(.data)))
+      
+      .data <- restrict_features_per_protein(
+        peptide_res, min_features=min_peptides, plot=FALSE)
+      
+      .data <- filterNA(.data, pNA=1-(min_samples/ncol(.data)))
+      
+      rows[[paste0(min_samples, min_peptides)]] <- fData(.data) %>%
+        select(Sequence, Modifications, Master.Protein.Accessions) %>%
+        mutate('min_samples'=min_samples, 'min_peptides'=min_peptides)
+    }
+  }
+  
+  peptide_filtering_options <- data.frame(do.call('rbind', rows))
+  
+  return(peptide_filtering_options)
+}
+
+peptide_filtering_options <- CheckFilteringOptions(peptide_res)
+```
+
+```{r}
+p <- peptide_filtering_options %>%
+  group_by(min_peptides, min_samples) %>%
+  tally() %>%
+  ggplot(aes(min_samples, n,
+             colour=factor(min_peptides),
+             group=min_peptides)) +
+  geom_line() +
+  geom_point() +
+  scale_colour_manual(values=get_cat_palette(4),
+                      name='Minimum peptides\nper protein') +
+  theme_camprot(base_size = 15) +
+  ylim(0, NA) +
+  xlab('Minimum samples with peptide detected') +
+  ylab('Peptides retained') +
+  scale_x_continuous(breaks=seq(2,12,2))
+  
+#tiff('../figures/peptide_retained_post_filter.tiff', units="in", width=5, height=4, res=300, compression = 'lzw')
+print(p)
+#dev.off()
+```
+lets filter at `min_samples` = 2 and `min_peptides` = 2. This is very relaxed, but we are going to validate candidates in the lab.
+
+```{r}
+filterPeptides <- function(peptide_abundance, min_samples, min_peptides){
+  .data <- restrict_features_per_protein(
+        peptide_abundance, min_features=min_peptides, plot=FALSE)
+      
+  .data <- filterNA(.data, pNA=1-(min_samples/ncol(.data)))
+  
+  .data <- restrict_features_per_protein(
+        peptide_abundance, min_features=min_peptides, plot=FALSE)
+      
+  .data <- filterNA(.data, pNA=1-(min_samples/ncol(.data)))
+  
+  .data <- restrict_features_per_protein(
+        peptide_abundance, min_features=min_peptides, plot=FALSE)
+      
+  .data <- filterNA(.data, pNA=1-(min_samples/ncol(.data)))
+  
+  return(.data)
+}
+```
+
+```{r}
+peptide_abundance_filtered <- filterPeptides(peptide_res,
+                                             min_samples=3,
+                                             min_peptides=2)
+
+```
+
+
+Later, we will want to return the question of how the min_samples and min_peptides affects the results so below we create an object to help us track this
+```{r}
+colnames(pData(peptide_abundance_filtered))[2] <- "sample_name"
+
+getPeptideProteinStats <- function(peptide_abundance_filtered){
+  peptide_abundance_long <- biobroom::tidy.MSnSet(peptide_abundance_filtered, addPheno=TRUE) %>%
+    filter(is.finite(value)) %>%
+    merge(fData(peptide_abundance_filtered), by.x='protein', by.y='row.names')
+  
+  n_samples_per_pep <- peptide_abundance_long %>%
+    group_by(protein) %>% tally()
+  
+  n_pep_per_protein <- peptide_abundance_long  %>%
+    group_by(Master.Protein.Accessions, sample_name) %>%
+    tally(name='n_peptides')
+  
+  mean_samples_per_pep_per_protein <- peptide_abundance_long  %>%
+    merge(n_samples_per_pep, by='protein') %>%
+    group_by(Master.Protein.Accessions, sample_name) %>%
+    dplyr::summarise('n_samples'=mean(n))
+  
+  peptide_protein_stats <- mean_samples_per_pep_per_protein %>%
+    merge(n_pep_per_protein, by=c('Master.Protein.Accessions', 'sample_name'))
+  return(peptide_protein_stats)
+  
+}
+
+peptide_protein_stats <- getPeptideProteinStats(peptide_abundance_filtered)
+```
+
+Below, we aggregate to protein level abundance using the `robust` method in MSnbase. At the same time, we store information in the feature data about the number of peptides used to quantify the protein.
+
+```{r}
+protein_abundance <- log(peptide_abundance_filtered, base=2) %>%
+  combineFeatures(method='robust',
+                  groupBy=fData(peptide_abundance_filtered)$Master.Protein.Accessions,
+                  maxit=1000L)
+                              
+peptides <- count_features_per_protein(peptide_abundance_filtered) %>%
+  pivot_wider(names_from=sample, values_from=n) %>%
+  tibble::column_to_rownames('Master.Protein.Accessions')
+fData(protein_abundance)$peptides <- peptides[,colnames(protein_abundance)]
+```
+
+Below, we summarize the number of missing values at peptide, filtered peptides and protein level
+```{r}
+#tiff('../figures/filter22Unpaired/plot_na_peptide.tiff', units="in", width=10, height=8, res=300, compression = 'lzw')
+plotNA(peptide_res)
+#dev.off()
+
+#tiff('../figures/filter22Unpaired/plot_na_protein.tiff', units="in", width=10, height=8, res=300, compression = 'lzw')
+plotNA(protein_abundance)
+#dev.off()
+```
+```{r, fig.height=10, fig.width=15}
+#library(naniar)
+dim(peptide_res)
+table(rowSums(is.na(exprs(peptide_res))))
+
+#tiff('../figures/filter22Unpaired/upset_na_peptide.tiff', units="in", width=12, height=8, res=300, compression = 'lzw')
+gg_miss_upset(data.frame(exprs(peptide_res)), nsets=12,
+              nintersects=20, keep.order=TRUE)
+#dev.off()
+dim(protein_abundance)
+table(rowSums(is.na(exprs(protein_abundance))))
+#tiff('../figures/filter22Unpaired/upset_na_protein.tiff', units="in", width=12, height=8, res=300, compression = 'lzw')
+gg_miss_upset(data.frame(exprs(protein_abundance)), nsets=12,
+              nintersects=20, keep.order=TRUE)
+#dev.off()
+```
+
+```{r}
+x <- protein_abundance[,pData(protein_abundance)$sample_name=='minus']
+table(rowSums(is.na(exprs(x))))
+#tiff('../figures/filter22Unpaired/upset_na_protein_minus_samples.tiff', units="in", width=5, height=4, res=300, compression = 'lzw')
+gg_miss_upset(data.frame(exprs(x)), nsets=12,
+              nintersects=20, keep.order=TRUE)
+#dev.off()
+x <- protein_abundance[,pData(protein_abundance)$sample_name!='minus']
+table(rowSums(is.na(exprs(x))))
+#tiff('../figures/filter22Unpaired/upset_na_protein_plus_samples.tiff', units="in", width=12, height=8, res=300, compression = 'lzw')
+gg_miss_upset(data.frame(exprs(x)), nsets=12,
+              nintersects=20, keep.order=TRUE)
+#dev.off()
+```
+Save out the objects to use in subsequent notebooks
+
+
+```{r}
+#saveRDS(peptide_res, '../results/peptide_abundance.rds')
+#saveRDS(peptide_abundance_filtered, '../results/peptide_abundance_filtered_22.rds')
+#saveRDS(protein_abundance, '../results/protein_abundance.rds')
+saveRDS(peptide_protein_stats, '../results/peptide_protein_stats.rds')
+```
